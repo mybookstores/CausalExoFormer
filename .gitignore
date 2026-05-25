@@ -1,0 +1,24 @@
+# Large CSV datasets (exceed GitHub 100MB hard limit)
+dataset/
+experiments/dataset/
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.dvi
+*.fdb_latexmk
+*.fls
+*.idv
+*.lg
+*.log
+*.out
+*.tmp
+*.txt
+*.xref
+*.4ct
+*.4tc
+*.css
+
+# Build outputs (optional, uncomment if needed)
+# *.pdf
