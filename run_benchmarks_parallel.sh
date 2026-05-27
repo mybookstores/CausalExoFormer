@@ -213,12 +213,12 @@ run_dataset() {
             # ETTh1: large model + seasonal MA=25 (verified)
             if [ "${dataset}" = "ETTh1" ]; then
                 causal_args="--revin_affine 1 --linear_residual 1 --linear_residual_seasonal 1 --linear_residual_seasonal_ma 25 --ablation bypass_causal --lambda_sparse 0 --lambda_consist 0"
-            # ETTh2: large model + seasonal MA=48 (capture 2-day cycles in hourly oil temp data)
+            # ETTh2: MSE_MAE loss (w=0.5) + seasonal residual for robust prediction
             elif [ "${dataset}" = "ETTh2" ]; then
-                causal_args="--revin_affine 1 --linear_residual 1 --linear_residual_seasonal 1 --linear_residual_seasonal_ma 48 --ablation bypass_causal --lambda_sparse 0 --lambda_consist 0"
-            # exchange_rate: small model with strong linear residual for random-walk-like dynamics
+                causal_args="--loss MSE_MAE --mse_mae_weight 0.5 --grad_clip 1.0 --revin_affine 1 --linear_residual 1 --linear_residual_seasonal 1 --linear_residual_seasonal_ma 48 --ablation bypass_causal --lambda_sparse 0 --lambda_consist 0"
+            # exchange_rate: small model + EMA prediction smoothing + endpoint lerp from encoder last value
             elif [ "${dataset}" = "exchange_rate" ]; then
-                causal_args="--revin_affine 0 --linear_residual 1 --linear_residual_init 1.0 --ablation bypass_causal --lambda_sparse 0 --lambda_consist 0"
+                causal_args="--revin_affine 0 --linear_residual 1 --linear_residual_init 1.0 --pred_smooth_method ema --pred_smooth_alpha 0.1 --pred_smooth_blend 1.0 --endpoint_lerp_strength 0.07 --ablation bypass_causal --lambda_sparse 0 --lambda_consist 0"
             # illness: seq_len=96/d_model=64 with simple residual is more stable than seasonal MA on tiny validation split
             elif [ "${dataset}" = "illness" ]; then
                 causal_args="--revin_affine 1 --linear_residual 1 --linear_residual_init 1.0 --ablation bypass_causal --lambda_sparse 0 --lambda_consist 0"

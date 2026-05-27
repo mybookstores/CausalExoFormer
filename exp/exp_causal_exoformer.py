@@ -35,6 +35,12 @@ class Exp_CausalExoFormer(Exp_Long_Term_Forecast):
         self.causal_warmup_epochs = getattr(args, 'causal_warmup_epochs', 5)
         self.causal_rampup_epochs = getattr(args, 'causal_rampup_epochs', 5)
         self.causal_lr_scale = getattr(args, 'causal_lr_scale', 10.0)
+        self.use_swa = bool(getattr(args, 'use_swa', 0))
+        self.swa_start = int(getattr(args, 'swa_start', 6))
+        self.swa_lr = float(getattr(args, 'swa_lr', 1e-5))
+        self.use_onecycle = bool(getattr(args, 'use_onecycle', 0))
+        self._swa_shadow = None
+        self._swa_count = 0
 
     def _get_raw_model(self):
         """Get the underlying model, unwrapping DataParallel if needed."""
@@ -63,6 +69,20 @@ class Exp_CausalExoFormer(Exp_Long_Term_Forecast):
         if self.args.use_amp:
             scaler = torch.cuda.amp.GradScaler()
 
+        onecycle_scheduler = None
+        if self.use_onecycle:
+            max_lrs = [self.args.learning_rate * self.causal_lr_scale if group.get('label') == 'causal' else self.args.learning_rate
+                       for group in model_optim.param_groups]
+            onecycle_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                model_optim,
+                max_lr=max_lrs,
+                total_steps=self.args.train_epochs * train_steps,
+                pct_start=float(getattr(self.args, 'onecycle_pct_start', 0.3)),
+                anneal_strategy='cos',
+                div_factor=25.0,
+                final_div_factor=1e4,
+            )
+
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
@@ -75,7 +95,10 @@ class Exp_CausalExoFormer(Exp_Long_Term_Forecast):
             causal_weight = self._get_causal_weight(epoch)
 
             # V2: Update causal param learning rate based on warmup
-            self._update_causal_lr(model_optim, epoch)
+            if onecycle_scheduler is None:
+                self._update_causal_lr(model_optim, epoch)
+            if self.use_swa and epoch >= self.swa_start and onecycle_scheduler is None:
+                self._set_swa_lr(model_optim)
 
             # Track last h_W for Lagrangian update
             last_h_W = 0.0
@@ -152,16 +175,26 @@ class Exp_CausalExoFormer(Exp_Long_Term_Forecast):
 
                 if self.args.use_amp:
                     scaler.scale(loss).backward()
+                    if getattr(self.args, 'grad_clip', 0.0) > 0:
+                        scaler.unscale_(model_optim)
+                        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(self.args.grad_clip))
                     scaler.step(model_optim)
                     scaler.update()
                 else:
                     loss.backward()
+                    if getattr(self.args, 'grad_clip', 0.0) > 0:
+                        nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(self.args.grad_clip))
                     model_optim.step()
+                if onecycle_scheduler is not None:
+                    onecycle_scheduler.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
             vali_loss = self.vali(vali_data, vali_loader, criterion)
             test_loss = self.vali(test_data, test_loader, criterion)
+
+            if self.use_swa and epoch >= self.swa_start:
+                self._update_swa_shadow()
 
             # V2: Augmented Lagrangian update only after warmup
             if epoch >= self.causal_warmup_epochs:
@@ -184,19 +217,47 @@ class Exp_CausalExoFormer(Exp_Long_Term_Forecast):
                 avg_h_W, avg_sparse, new_temp, self.rho, self.alpha_lagrangian, causal_weight))
 
             early_stopping(vali_loss, self.model, path)
+            if getattr(self.args, 'use_train_loss_early_stopping', 0):
+                self._train_loss_checkpoint = train_loss
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
 
-            adjust_learning_rate(model_optim, epoch + 1, self.args)
+            if onecycle_scheduler is None:
+                adjust_learning_rate(model_optim, epoch + 1, self.args)
 
         best_model_path = path + '/' + 'checkpoint.pth'
+        if getattr(self.args, 'use_train_loss_early_stopping', 0) and early_stopping.best_train_loss_path is not None:
+            best_model_path = early_stopping.best_train_loss_path
+            print(f"Using train-loss-selected checkpoint: {best_model_path}")
         self.model.load_state_dict(torch.load(best_model_path, map_location=self.device))
+        if self.use_swa and self._swa_shadow is not None:
+            self.model.load_state_dict(self._swa_shadow)
+            print(f"Using SWA averaged weights from {self._swa_count} checkpoints")
 
         # Print causal structure summary after loading best model
         self._print_causal_summary()
 
         return self.model
+
+    def _set_swa_lr(self, optimizer):
+        for group in optimizer.param_groups:
+            if group.get('label') != 'causal':
+                group['lr'] = self.swa_lr
+
+    def _update_swa_shadow(self):
+        state = self.model.state_dict()
+        if self._swa_shadow is None:
+            self._swa_shadow = {k: v.detach().clone() for k, v in state.items()}
+        else:
+            next_count = self._swa_count + 1
+            for k, v in state.items():
+                value = v.detach()
+                if torch.is_floating_point(value):
+                    self._swa_shadow[k].mul_(self._swa_count / next_count).add_(value, alpha=1.0 / next_count)
+                else:
+                    self._swa_shadow[k] = value.clone()
+        self._swa_count += 1
 
     def _build_optimizer(self):
         """V2: Build optimizer with separate param groups for prediction and causal params."""

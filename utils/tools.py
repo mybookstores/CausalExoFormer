@@ -43,8 +43,10 @@ class EarlyStopping:
         self.early_stop = False
         self.val_loss_min = np.inf
         self.delta = delta
+        self.best_train_loss = np.inf
+        self.best_train_loss_path = None
 
-    def __call__(self, val_loss, model, path):
+    def __call__(self, val_loss, model, path, train_loss=None):
         score = -val_loss
         if self.best_score is None:
             self.best_score = score
@@ -58,6 +60,9 @@ class EarlyStopping:
             self.best_score = score
             self.save_checkpoint(val_loss, model, path)
             self.counter = 0
+        if train_loss is not None and train_loss < self.best_train_loss:
+            self.best_train_loss = train_loss
+            self.best_train_loss_path = path + '/' + 'checkpoint.pth'
 
     def save_checkpoint(self, val_loss, model, path):
         if self.verbose:

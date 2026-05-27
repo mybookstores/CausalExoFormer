@@ -87,3 +87,8 @@ class mase_loss(nn.Module):
         masep = t.mean(t.abs(insample[:, freq:] - insample[:, :-freq]), dim=1)
         masked_masep_inv = divide_no_nan(mask, masep[:, None])
         return t.mean(t.abs(target - forecast) * masked_masep_inv)
+
+
+def tari_loss(pred: t.Tensor, true: t.Tensor, alpha: float = 0.7) -> t.Tensor:
+    alpha = float(alpha)
+    return alpha * t.mean((pred - true) ** 2) + (1 - alpha) * t.mean(t.abs(pred - true))

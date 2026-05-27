@@ -91,9 +91,42 @@ if __name__ == '__main__':
     parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
+    parser.add_argument('--use_train_loss_early_stopping', type=int, default=0, choices=[0, 1],
+                        help='use train loss (not val loss) for early stopping checkpoint selection; useful for tiny validation sets')
     parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
     parser.add_argument('--des', type=str, default='test', help='exp description')
-    parser.add_argument('--loss', type=str, default='MSE', help='loss function')
+    parser.add_argument('--loss', type=str, default='MSE', help='loss function: MSE, MAE, Huber, SmoothL1, MSE_MAE, or Tari')
+    parser.add_argument('--huber_delta', type=float, default=1.0, help='delta for Huber loss')
+    parser.add_argument('--smooth_l1_beta', type=float, default=1.0, help='beta for SmoothL1 loss')
+    parser.add_argument('--mse_mae_weight', type=float, default=0.5, help='MSE weight for MSE_MAE loss; MAE weight is 1 - this value')
+    parser.add_argument('--tari_alpha', type=float, default=0.7, help='MSE weight for Tari loss; MAE weight is 1 - this value')
+    parser.add_argument('--grad_clip', type=float, default=0.0, help='gradient norm clipping (0=disabled)')
+    parser.add_argument('--use_swa', type=int, default=0, choices=[0, 1], help='use stochastic weight averaging after swa_start')
+    parser.add_argument('--swa_start', type=int, default=6, help='epoch index to start SWA averaging')
+    parser.add_argument('--swa_lr', type=float, default=1e-5, help='learning rate for non-causal params during SWA epochs')
+    parser.add_argument('--use_onecycle', type=int, default=0, choices=[0, 1], help='use batch-level OneCycleLR instead of epoch-level lr adjustment')
+    parser.add_argument('--onecycle_pct_start', type=float, default=0.3, help='warmup fraction for OneCycleLR')
+    parser.add_argument('--pred_smooth_method', type=str, default='none', choices=['none', 'ema', 'ma', 'endpoint_linear'],
+                        help='optional prediction smoothing method applied before metric calculation')
+    parser.add_argument('--pred_smooth_alpha', type=float, default=0.1, help='EMA alpha for prediction smoothing')
+    parser.add_argument('--pred_smooth_window', type=int, default=3, help='moving average window for prediction smoothing')
+    parser.add_argument('--pred_smooth_blend', type=float, default=1.0, help='blend weight for smoothed prediction')
+    parser.add_argument('--endpoint_lerp_strength', type=float, default=0.0,
+                        help='linear interpolation strength from encoder last value toward predictions (0=disabled, 0.1=light, 1.0=full)')
+    parser.add_argument('--calibration_method', type=str, default='none',
+                        choices=['none', 'affine', 'endpoint_lerp', 'smooth_blend'],
+                        help='fit optional test-time calibration on validation predictions only')
+    parser.add_argument('--calibration_grid_size', type=int, default=51,
+                        help='number of grid points for validation-fitted calibration searches')
+    parser.add_argument('--calibration_max_strength', type=float, default=1.0,
+                        help='maximum endpoint_lerp strength searched by validation-fitted calibration')
+    parser.add_argument('--calibration_smooth_method', type=str, default='ema',
+                        choices=['ema', 'ma', 'endpoint_linear'],
+                        help='smoothing method used by calibration_method=smooth_blend')
+    parser.add_argument('--calibration_smooth_alpha', type=float, default=0.1,
+                        help='EMA alpha used by calibration_method=smooth_blend')
+    parser.add_argument('--calibration_smooth_window', type=int, default=3,
+                        help='moving-average window used by calibration_method=smooth_blend')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
     parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
@@ -169,6 +202,18 @@ if __name__ == '__main__':
                         help='enable DLinear-style trend+seasonal decomposition for linear residual branch')
     parser.add_argument('--linear_residual_seasonal_ma', type=int, default=25,
                         help='moving average window size for seasonal residual decomposition (default 25)')
+    parser.add_argument('--two_stage_residual', type=int, default=0, choices=[0, 1],
+                        help='use linear/decomposition residual as detached baseline and learn CausalExoFormer delta')
+    parser.add_argument('--multi_scale_residual', type=int, default=0, choices=[0, 1],
+                        help='enable multi-scale trend+seasonal residual branch in CausalExoFormer')
+    parser.add_argument('--multi_scale_windows', type=str, default='13,25,48,96',
+                        help='comma-separated moving-average windows for multi-scale residual')
+    parser.add_argument('--fft_residual', type=int, default=0, choices=[0, 1],
+                        help='enable FFT trend/seasonal residual branch in CausalExoFormer')
+    parser.add_argument('--fft_residual_top_k', type=int, default=5,
+                        help='number of non-DC FFT frequencies kept for FFT residual')
+    parser.add_argument('--adaptive_residual_gate', type=int, default=0, choices=[0, 1],
+                        help='use adaptive gating to blend transformer + linear residual (data-dependent blend)')
 
     # CausalExoFormer
     parser.add_argument('--num_lags', type=int, default=14, help='number of causal lags for exogenous variables')

@@ -2,7 +2,11 @@
 dataset/
 experiments/dataset/
 
-# LaTeX build artifacts
+# Model checkpoints (large binary files)
+checkpoints/
+*.pth
+
+# LaTeX build artifacts and source
 *.aux
 *.bbl
 *.blg
@@ -19,6 +23,10 @@ experiments/dataset/
 *.4ct
 *.4tc
 *.css
+*.tex
+
+# HTML files
+*.html
 
 # Build outputs (optional, uncomment if needed)
 # *.pdf

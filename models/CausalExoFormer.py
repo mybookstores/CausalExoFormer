@@ -57,19 +57,20 @@ class MultiLagVariateEmbedding(nn.Module):
         self.d_model = d_model
         self.num_lags = num_lags
         self.lag_step = lag_step
-        # Main projection: will be dynamically sized based on whether x_mark is provided
-        # Input dim = seq_len for data + potentially mark features
+        # Main projection: both the plain and mark-augmented branches project along
+        # the time axis, so the in_features are fixed at seq_len.
         self.value_embedding = nn.Linear(seq_len, d_model)
         # Learnable padding token for truncated sequences [1, 1, d_model]
         self.padding_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
         self.dropout = nn.Dropout(p=dropout)
-        self._mark_proj = None  # Lazy init for mark-augmented projection
+        self._mark_proj = nn.Linear(seq_len, d_model)
+        nn.init.xavier_uniform_(self._mark_proj.weight)
+        nn.init.zeros_(self._mark_proj.bias)
 
     def _get_mark_proj(self, total_dim, device):
-        """Lazily create a projection layer for mark-augmented input."""
-        if self._mark_proj is None or self._mark_proj.in_features != total_dim:
+        """Return the mark-augmented projection layer."""
+        if self._mark_proj.in_features != total_dim:
             self._mark_proj = nn.Linear(total_dim, self.d_model).to(device)
-            # Initialize with similar scale as value_embedding
             nn.init.xavier_uniform_(self._mark_proj.weight)
             nn.init.zeros_(self._mark_proj.bias)
         return self._mark_proj
@@ -508,11 +509,37 @@ class Model(nn.Module):
         self.head_nf = configs.d_model * (self.patch_num + 1)
         self.head = FlattenHead(configs.enc_in, self.head_nf, configs.pred_len,
                                 head_dropout=configs.dropout)
-        self.use_linear_residual = bool(getattr(configs, 'linear_residual', 0))
+        self.use_fft_residual = bool(getattr(configs, 'fft_residual', 0))
+        self.use_multiscale_residual = bool(getattr(configs, 'multi_scale_residual', 0))
+        self.use_linear_residual = bool(getattr(configs, 'linear_residual', 0)) or self.use_multiscale_residual or self.use_fft_residual
         self.use_seasonal_residual = bool(getattr(configs, 'linear_residual_seasonal', 0))
+        self.two_stage_residual = bool(getattr(configs, 'two_stage_residual', 0))
         residual_init = float(getattr(configs, 'linear_residual_init', 0.1))
         if self.use_linear_residual:
-            if self.use_seasonal_residual:
+            if self.use_fft_residual:
+                self.fft_top_k = int(getattr(configs, 'fft_residual_top_k', 5))
+                self.fft_trend_linear = nn.Linear(configs.seq_len, configs.pred_len)
+                self.fft_seasonal_linear = nn.Linear(configs.seq_len, configs.pred_len)
+                self._init_average_linear(self.fft_trend_linear, configs.seq_len)
+                self._init_average_linear(self.fft_seasonal_linear, configs.seq_len)
+                self.fft_trend_alpha = nn.Parameter(torch.tensor(residual_init))
+                self.fft_seasonal_alpha = nn.Parameter(torch.tensor(residual_init))
+            elif self.use_multiscale_residual:
+                self.ms_windows = self._parse_multiscale_windows(getattr(configs, 'multi_scale_windows', '13,25,48,96'))
+                self.ms_trend_lines = nn.ModuleList([nn.Linear(configs.seq_len, configs.pred_len) for _ in self.ms_windows])
+                self.ms_seasonal_lines = nn.ModuleList([nn.Linear(configs.seq_len, configs.pred_len) for _ in self.ms_windows])
+                self.ms_trend_alphas = nn.ParameterList([
+                    nn.Parameter(torch.tensor(residual_init)) for _ in self.ms_windows
+                ])
+                self.ms_seasonal_alphas = nn.ParameterList([
+                    nn.Parameter(torch.tensor(residual_init)) for _ in self.ms_windows
+                ])
+                self.ms_scale_logits = nn.Parameter(torch.zeros(len(self.ms_windows)))
+                for line in self.ms_trend_lines:
+                    self._init_average_linear(line, configs.seq_len)
+                for line in self.ms_seasonal_lines:
+                    self._init_average_linear(line, configs.seq_len)
+            elif self.use_seasonal_residual:
                 self.ma_window = int(getattr(configs, 'linear_residual_seasonal_ma', 25))
                 self.trend_linear = nn.Linear(configs.seq_len, configs.pred_len)
                 self.seasonal_linear = nn.Linear(configs.seq_len, configs.pred_len)
@@ -525,6 +552,18 @@ class Model(nn.Module):
                 self._init_average_linear(self.linear_residual, configs.seq_len)
                 self.linear_residual_alpha = nn.Parameter(torch.tensor(residual_init))
         self._last_attn_weights = None
+
+        # ============ A2: Adaptive residual gating (data-dependent blend) ============
+        # Gate computed from encoder output → controls how much to trust linear residual
+        self.use_adaptive_gate = bool(getattr(configs, 'adaptive_residual_gate', 0))
+        if self.use_adaptive_gate:
+            self.gate_mlp = nn.Sequential(
+                nn.Linear(configs.d_model, configs.d_model // 2),
+                nn.GELU(),
+                nn.Linear(configs.d_model // 2, 1),
+            )
+            nn.init.zeros_(self.gate_mlp[-1].weight)
+            nn.init.zeros_(self.gate_mlp[-1].bias)
 
         # ============ A1: RevIN affine (learnable gamma/beta after instance-norm) ============
         # Default off for backward compatibility; only active when configs.revin_affine == 1
@@ -539,6 +578,19 @@ class Model(nn.Module):
         nn.init.constant_(linear.weight, 1.0 / seq_len)
         if linear.bias is not None:
             nn.init.zeros_(linear.bias)
+
+    @staticmethod
+    def _parse_multiscale_windows(windows):
+        if isinstance(windows, str):
+            parsed = [int(w.strip()) for w in windows.split(',') if w.strip()]
+        elif isinstance(windows, (list, tuple)):
+            parsed = [int(w) for w in windows]
+        else:
+            parsed = [int(windows)]
+        parsed = [w for w in parsed if w > 0]
+        if not parsed:
+            raise ValueError('multi_scale_windows must contain at least one positive integer')
+        return parsed
 
     def _moving_avg(self, x, window):
         """Compute edge-padded moving average along time dim. x: [B, T, C]"""
@@ -567,6 +619,49 @@ class Model(nn.Module):
         pred_trend = self.trend_linear(trend)                # [B, pred_len]
         pred_seasonal = self.seasonal_linear(seasonal)        # [B, pred_len]
         return (self.trend_alpha * pred_trend + self.seasonal_alpha * pred_seasonal).unsqueeze(-1)
+
+    def _compute_fft_residual(self, target: torch.Tensor) -> torch.Tensor:
+        t = target.squeeze(-1)
+        xf = torch.fft.rfft(t, dim=1)
+        freq = torch.abs(xf)
+        if freq.shape[1] > 0:
+            freq[:, 0] = 0
+        k = min(max(int(self.fft_top_k), 0), max(freq.shape[1] - 1, 0))
+        if k > 0:
+            top_idx = torch.topk(freq, k=k, dim=1).indices
+            mask = torch.zeros_like(freq, dtype=torch.bool)
+            mask.scatter_(1, top_idx, True)
+            if mask.shape[1] > 0:
+                mask[:, 0] = False
+            seasonal = torch.fft.irfft(xf * mask.to(dtype=xf.dtype), n=t.shape[1], dim=1)
+        else:
+            seasonal = torch.zeros_like(t)
+        trend = t - seasonal
+        pred_trend = self.fft_trend_linear(trend)
+        pred_seasonal = self.fft_seasonal_linear(seasonal)
+        return (self.fft_trend_alpha * pred_trend + self.fft_seasonal_alpha * pred_seasonal).unsqueeze(-1)
+
+    def _compute_multiscale_residual(self, target: torch.Tensor) -> torch.Tensor:
+        t = target.squeeze(-1)
+        weights = F.softmax(self.ms_scale_logits, dim=0)
+        residual = None
+        for i, window in enumerate(self.ms_windows):
+            trend = self._moving_avg(t.unsqueeze(-1), window).squeeze(-1)
+            seasonal = t - trend
+            pred_trend = self.ms_trend_lines[i](trend)
+            pred_seasonal = self.ms_seasonal_lines[i](seasonal)
+            scale_residual = (self.ms_trend_alphas[i] * pred_trend + self.ms_seasonal_alphas[i] * pred_seasonal).unsqueeze(-1)
+            weighted = weights[i] * scale_residual
+            residual = weighted if residual is None else residual + weighted
+        return residual
+
+    def _compose_residual(self, dec_out, residual, gate=None):
+        if self.two_stage_residual:
+            return residual.detach() + dec_out
+        if gate is not None:
+            gate = gate.view(-1, 1, 1)
+            return gate * dec_out + (1 - gate) * residual
+        return dec_out + residual
 
     def _select_top_exogenous(self, x_exo, x_target):
         if self.causal_top_k <= 0 or x_exo.shape[2] <= self.causal_top_k:
@@ -643,16 +738,25 @@ class Model(nn.Module):
         enc_out, attn_weights_list = self.encoder(en_embed, ex_embed, causal_gate=causal_gate)
         if self.training and len(attn_weights_list) > 0:
             self._last_attn_weights = attn_weights_list
+        if self.use_adaptive_gate:
+            # Pool enc_out [B*n_vars, L, d_model] → [B, d_model] for gate
+            enc_for_gate = enc_out.reshape(-1, n_vars, enc_out.shape[-2], enc_out.shape[-1])
+            enc_for_gate = enc_for_gate.mean(dim=1).mean(dim=1)  # [B, d_model]
+            g = torch.sigmoid(self.gate_mlp(enc_for_gate))  # [B, 1]
         enc_out = torch.reshape(enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         enc_out = enc_out.permute(0, 1, 3, 2)
         dec_out = self.head(enc_out)
         dec_out = dec_out.permute(0, 2, 1)
         if self.use_linear_residual:
-            if self.use_seasonal_residual:
+            if self.use_fft_residual:
+                residual = self._compute_fft_residual(x_enc[:, :, -1:])
+            elif self.use_multiscale_residual:
+                residual = self._compute_multiscale_residual(x_enc[:, :, -1:])
+            elif self.use_seasonal_residual:
                 residual = self._compute_seasonal_residual(x_enc[:, :, -1:])
             else:
                 residual = self.linear_residual_alpha * self.linear_residual(x_enc[:, :, -1].contiguous()).unsqueeze(-1)
-            dec_out = dec_out + residual
+            dec_out = self._compose_residual(dec_out, residual, g if self.use_adaptive_gate else None)
         if self.use_norm:
             if self.use_revin_affine:
                 # invert affine: subtract beta then divide by gamma (only for last channel = target)
@@ -680,16 +784,25 @@ class Model(nn.Module):
         enc_out, attn_weights_list = self.encoder(en_embed, ex_embed, causal_gate=causal_gate)
         if self.training and len(attn_weights_list) > 0:
             self._last_attn_weights = attn_weights_list
+        if self.use_adaptive_gate:
+            # Pool enc_out [B*n_vars, L, d_model] → [B, d_model] for gate
+            enc_for_gate = enc_out.reshape(-1, n_vars, enc_out.shape[-2], enc_out.shape[-1])
+            enc_for_gate = enc_for_gate.mean(dim=1).mean(dim=1)  # [B, d_model]
+            g = torch.sigmoid(self.gate_mlp(enc_for_gate))  # [B, 1]
         enc_out = torch.reshape(enc_out, (-1, n_vars, enc_out.shape[-2], enc_out.shape[-1]))
         enc_out = enc_out.permute(0, 1, 3, 2)
         dec_out = self.head(enc_out)
         dec_out = dec_out.permute(0, 2, 1)
         if self.use_linear_residual:
-            if self.use_seasonal_residual:
+            if self.use_fft_residual:
+                residual = self._compute_fft_residual(x_enc.mean(dim=2, keepdim=True))
+            elif self.use_multiscale_residual:
+                residual = self._compute_multiscale_residual(x_enc.mean(dim=2, keepdim=True))
+            elif self.use_seasonal_residual:
                 residual = self._compute_seasonal_residual(x_enc.mean(dim=2, keepdim=True))
             else:
                 residual = self.linear_residual_alpha * self.linear_residual(x_enc.permute(0, 2, 1)).permute(0, 2, 1)
-            dec_out = dec_out + residual
+            dec_out = self._compose_residual(dec_out, residual, g if self.use_adaptive_gate else None)
         if self.use_norm:
             if self.use_revin_affine:
                 dec_out = dec_out - self.revin_beta.view(1, 1, -1)
