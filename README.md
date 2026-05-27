@@ -6,30 +6,36 @@
 
 ## Project Structure
 
-```
-experiments/
-├── run.py                          # Main entry point (train/evaluate)
-├── run_benchmarks_parallel.sh       # Run 8 standard benchmarks in parallel
-├── run_lakes_parallel.sh           # Run 5 lake datasets in parallel
+The repository root mirrors the original `experiments/` directory from local development.
+
+```text
+.
+├── run.py                         # Main entry point (train/evaluate)
+├── run_benchmarks_parallel.sh     # Run standard benchmarks in parallel
+├── run_lakes_parallel.sh          # Run lake benchmarks in parallel
 ├── data_provider/
-│   ├── data_loader.py              # Dataset classes
-│   └── data_factory.py             # Dataset factory
+│   ├── data_loader.py             # Dataset classes
+│   └── data_factory.py            # Dataset factory
 ├── exp/
-│   ├── exp_causal_exoformer.py     # CausalExoFormer training logic
-│   └── ...                         # Other experiment classes
+│   ├── exp_causal_exoformer.py    # CausalExoFormer training logic
+│   └── ...                        # Other experiment classes
 ├── models/
-│   ├── CausalExoFormer.py          # Main model
-│   ├── TimeXer.py, iTransformer.py, PatchTST.py, DLinear.py, Autoformer.py, ...
-├── layers/                         # Building blocks
-├── utils/                          # Metrics, tools
-└── dataset/                        # Data directory
-    ├── ETT-small/                  # ETTh1, ETTh2, ETTm1, ETTm2
+│   ├── CausalExoFormer.py         # Main model
+│   ├── TimeXer.py
+│   ├── iTransformer.py
+│   ├── PatchTST.py
+│   ├── DLinear.py
+│   └── Autoformer.py
+├── layers/                        # Building blocks
+├── utils/                         # Metrics, losses, scheduling, helpers
+└── dataset/                       # Data directory
+    ├── ETT-small/                 # ETTh1, ETTh2, ETTm1, ETTm2
     ├── electricity/
     ├── exchange_rate/
     ├── illness/
     ├── traffic/
     ├── weather/
-    └── lake/                       # Great Lakes water quality data
+    └── lake/                      # Great Lakes water quality data
         ├── erie1.csv
         ├── huron1.csv
         ├── huron2.csv
@@ -52,9 +58,9 @@ pip install datasets huggingface_hub  # optional, for auto-downloading standard 
 
 ### Single Run
 
-```bash
-cd experiments
+Run commands from the repository root.
 
+```bash
 # Lake water quality prediction
 python run.py \
     --task_name long_term_forecast \
@@ -137,15 +143,37 @@ python run.py \
 - `--d_layers`: Decoder layers (default: 1)
 - `--patch_len`: Patch length (default: 16)
 
+### Training and Optimization
+- `--loss`: `MSE`, `MAE`, `Huber`, `SmoothL1`, `MSE_MAE`, or `Tari`
+- `--huber_delta`, `--smooth_l1_beta`: Loss-specific hyperparameters
+- `--mse_mae_weight`, `--tari_alpha`: Blend weights for mixed losses
+- `--grad_clip`: Gradient norm clipping (`0` disables clipping)
+- `--use_train_loss_early_stopping`: Select the checkpoint with the best train loss instead of validation loss
+- `--use_onecycle`, `--onecycle_pct_start`: Enable batch-level OneCycleLR scheduling
+- `--use_swa`, `--swa_start`, `--swa_lr`: Enable stochastic weight averaging in later epochs
+
 ### CausalExoFormer Specific
 - `--num_lags`: Number of causal lags for exogenous variables (default: 14)
 - `--lag_step`: Step size between lags (default: 1)
 - `--lambda_sparse`: Sparsity regularization weight (default: 0.01)
 - `--lambda_dag`: DAG constraint penalty coefficient (default: 1.0)
-- `--causal_warmup_epochs`: Warmup epochs before enabling causal losses (default: 1)
-- `--causal_rampup_epochs`: Ramp-up epochs to full causal loss weight (default: 3)
+- `--causal_warmup_epochs`: Warmup epochs before enabling causal losses
+- `--causal_rampup_epochs`: Ramp-up epochs to full causal loss weight
 - `--revin_affine`: Enable learnable affine after instance norm (0/1)
 - `--linear_residual`: Enable target-linear residual branch (0/1)
+- `--linear_residual_seasonal`, `--linear_residual_seasonal_ma`: Use trend/seasonal residual decomposition
+- `--two_stage_residual`: Learn a delta on top of a detached residual baseline
+- `--multi_scale_residual`, `--multi_scale_windows`: Use multi-window residual decomposition
+- `--fft_residual`, `--fft_residual_top_k`: Use FFT-based trend/seasonal residuals
+- `--adaptive_residual_gate`: Blend transformer output and residual branch with a learned gate
+
+### Prediction Post-processing and Calibration
+- `--pred_smooth_method`: `none`, `ema`, `ma`, or `endpoint_linear`
+- `--pred_smooth_alpha`, `--pred_smooth_window`, `--pred_smooth_blend`: Smoothing controls
+- `--endpoint_lerp_strength`: Blend predictions with the last encoder value
+- `--calibration_method`: `none`, `affine`, `endpoint_lerp`, or `smooth_blend`
+- `--calibration_grid_size`, `--calibration_max_strength`: Validation-time search controls
+- `--calibration_smooth_method`, `--calibration_smooth_alpha`, `--calibration_smooth_window`: Calibration smoothing controls
 
 ---
 
@@ -166,6 +194,8 @@ bash run_benchmarks_parallel.sh --causal-only
 # Kill all jobs
 bash run_benchmarks_parallel.sh --kill
 ```
+
+The benchmark script now includes dataset-specific tuning presets for harder cases such as ETTh2 and exchange_rate, including mixed losses, gradient clipping, residual settings, and prediction smoothing.
 
 ### Lake Datasets
 
@@ -189,11 +219,13 @@ bash run_lakes_parallel.sh --kill
   - `metrics.npy`: Evaluation metrics
   - `pred.npy`: Predictions
   - `true.npy`: Ground truth
+  - `val_pred.npy`, `val_true.npy`: Saved when validation-based calibration is enabled
 - **Causal Analysis** (CausalExoFormer only):
   - `causal_graph.npy`: Learned causal gate matrix
   - `lag_distribution.npy`: Lag softmax distribution
   - `causal_heatmap.png`: Visualization of causal relationships
 
+Generated artifacts such as checkpoints, HTML, TeX intermediates, and large local datasets are intentionally ignored in Git so that repository syncs only include source changes.
 ---
 
 ## Metrics
